@@ -1,0 +1,505 @@
+###################################
+# Navid Ramezani - IRANBOURSE.NET #
+###################################
+
+import sys
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import brentq
+from scipy.interpolate import RectBivariateSpline
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QComboBox, QMessageBox, QProgressBar, QFileDialog, QGroupBox, QFormLayout
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import logging
+from scipy.interpolate import RectBivariateSpline
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+# ----------------------- Model Components -----------------------
+
+class Option:
+    def __init__(self, spot, strike, risk_free, maturity, option_type="call"):
+        self.spot = spot
+        self.strike = strike
+        self.risk_free = risk_free
+        self.maturity = maturity
+        self.option_type = option_type.lower()
+
+        if self.option_type not in ("call", "put"):
+            raise ValueError("Invalid option_type, please select 'call' or 'put'.")
+
+    def _d1_d2(self, sigma):
+        if sigma <= 0:
+            raise ValueError("Sigma must be positive.")
+        d1 = (
+            np.log(self.spot / self.strike)
+            + (self.risk_free + 0.5 * sigma ** 2) * self.maturity
+        ) / (sigma * np.sqrt(self.maturity))
+        d2 = d1 - sigma * np.sqrt(self.maturity)
+        return d1, d2
+
+    def calculate_price(self, sigma):
+        d1, d2 = self._d1_d2(sigma)
+        if self.option_type == "call":
+            return (
+                self.spot * norm.cdf(d1)
+                - self.strike * np.exp(-self.risk_free * self.maturity) * norm.cdf(d2)
+            )
+        else:
+            return (
+                self.strike * np.exp(-self.risk_free * self.maturity) * norm.cdf(-d2)
+                - self.spot * norm.cdf(-d1)
+            )
+
+    def implied_volatility(self, actual_price):
+        if actual_price <= 0:
+            return np.nan
+
+        def objective_function(sigma):
+            try:
+                return self.calculate_price(sigma) - actual_price
+            except ValueError:
+                return np.inf
+
+        low, high = 1e-4, 5.0
+        try:
+            return brentq(objective_function, low, high, xtol=1e-6)
+        except (ValueError, RuntimeError):
+            return np.nan
+
+
+class VolatilitySurfaceFromFile:
+    def __init__(self, file_path, risk_free_rate, option_type="call",
+                 maturity_min=0.1, maturity_max=2.0,
+                 moneyness_min=0.95, moneyness_max=1.5):
+        self._file_path = file_path
+        self._risk_free_rate = risk_free_rate
+        self._option_type = option_type.lower()
+        self._maturity_min = maturity_min
+        self._maturity_max = maturity_max
+        self._moneyness_min = moneyness_min
+        self._moneyness_max = moneyness_max
+
+        self._spot = None
+        self._ttm_grid = None
+        self._strike_grid = None
+
+        # Read CSV file and map headers dynamically
+        self._data = pd.read_csv(file_path)
+        self._header_map = self._map_headers(self._data)
+
+    def _map_headers(self, df):
+        """
+        Dynamically map the headers from the CSV file to standard names for use in the code.
+        """
+        header_mapping = {
+            'spot': ['ulast1'],  # Spot price of the underlying asset
+            'strike': ['strike'],  # Strike price of the option
+            'last_price': ['last1'],  # Last traded price of the option (market price)
+            'days_to_maturity': ['days'],  # Days until expiration
+            'option_type': ['ticker_type'],  # Call/Put type
+        }
+
+        mapped_headers = {}
+        for key, possible_headers in header_mapping.items():
+            for possible_header in possible_headers:
+                if possible_header in df.columns:
+                    mapped_headers[key] = possible_header
+                    break
+            if key not in mapped_headers:
+                raise ValueError(f"Required column for '{key}' not found in the CSV file.")
+        
+        return mapped_headers
+
+    def process_data(self):
+        option_type_column = self._header_map['option_type']
+
+        data_filtered = self._data[
+            (self._data[option_type_column].str.lower() == self._option_type)
+        ]
+
+        if data_filtered.empty:
+            raise ValueError(f"No data found for option type '{self._option_type}'.")
+
+        spot_column = self._header_map['spot']
+        self._spot = data_filtered.iloc[0][spot_column]
+
+        strike_column = self._header_map['strike']
+        data_filtered.loc[:, 'moneyness'] = data_filtered[strike_column] / self._spot  # Fix for SettingWithCopyWarning
+
+        days_to_maturity_column = self._header_map['days_to_maturity']
+        data_filtered.loc[:, 'ttm'] = data_filtered[days_to_maturity_column] / 252  # Fix for SettingWithCopyWarning
+
+        # Filter by moneyness and maturity
+        data_filtered = data_filtered[
+            (data_filtered['moneyness'] >= self._moneyness_min)
+            & (data_filtered['moneyness'] <= self._moneyness_max)
+        ]
+
+        data_filtered = data_filtered[
+            (data_filtered['ttm'] >= self._maturity_min)
+            & (data_filtered['ttm'] <= self._maturity_max)
+        ]
+
+        if data_filtered.empty:
+            raise ValueError("No options data within the specified moneyness and maturity ranges.")
+
+        logging.info(f"Processed Data: \n{data_filtered.head()}")  # Log the first few rows for verification
+
+        return data_filtered
+
+    def generate_implied_volatility_surface(self):
+        data_filtered = self.process_data()
+
+        strike_column = self._header_map['strike']
+        last_price_column = self._header_map['last_price']
+
+        strikes = data_filtered[strike_column].unique()
+        maturities = data_filtered['ttm'].unique()
+
+        pivot_table = data_filtered.pivot_table(
+            index='ttm', columns=strike_column, values=last_price_column, aggfunc='mean', fill_value=np.nan
+        )
+
+        implied_vols = np.full(pivot_table.values.shape, np.nan)
+
+        for i, time in enumerate(pivot_table.index):
+            for j, strike in enumerate(pivot_table.columns):
+                price = pivot_table.iloc[i, j]
+                if np.isnan(price) or price <= 0:
+                    continue
+                option = Option(
+                    spot=self._spot,
+                    strike=strike,
+                    risk_free=self._risk_free_rate,
+                    maturity=time,
+                    option_type=self._option_type,
+                )
+                iv = option.implied_volatility(actual_price=price)
+                implied_vols[i, j] = iv
+
+        # Handling NaN values using interpolation
+        mask = ~np.isnan(implied_vols)
+
+        # Only proceed if we have enough valid data points for interpolation
+        if np.count_nonzero(mask) < 4:
+            raise ValueError("Not enough valid data to perform interpolation")
+
+        valid_ttms = pivot_table.index[mask.any(axis=1)]
+        valid_strikes = pivot_table.columns[mask.any(axis=0)]
+        valid_vols = implied_vols[mask]
+
+        # Perform interpolation with RectBivariateSpline
+        spline_interpolator = RectBivariateSpline(valid_ttms, valid_strikes, valid_vols, kx=2, ky=2)
+
+        # Reconstruct the full grid with interpolated values
+        ttm_grid, strike_grid = np.meshgrid(pivot_table.index, pivot_table.columns, indexing='ij')
+        interpolated_vols = spline_interpolator(ttm_grid[:, 0], strike_grid[0, :])
+
+        # Return interpolated implied volatilities and grids
+        self._ttm_grid = ttm_grid
+        self._strike_grid = strike_grid
+
+        logging.info(f"Implied Volatility Surface (after interpolation): \n{interpolated_vols}")
+
+        return interpolated_vols, ttm_grid, strike_grid
+
+    def generate_implied_volatility_surface(self):
+        data_filtered = self.process_data()
+
+        strike_column = self._header_map['strike']
+        last_price_column = self._header_map['last_price']
+
+        strikes = data_filtered[strike_column].unique()
+        maturities = data_filtered['ttm'].unique()
+
+        pivot_table = data_filtered.pivot_table(
+            index='ttm', columns=strike_column, values=last_price_column, aggfunc='mean', fill_value=np.nan
+        )
+
+        implied_vols = np.full(pivot_table.values.shape, np.nan)
+
+        for i, time in enumerate(pivot_table.index):
+            for j, strike in enumerate(pivot_table.columns):
+                price = pivot_table.iloc[i, j]
+                if np.isnan(price) or price <= 0:
+                    continue
+                option = Option(
+                    spot=self._spot,
+                    strike=strike,
+                    risk_free=self._risk_free_rate,
+                    maturity=time,
+                    option_type=self._option_type,
+                )
+                iv = option.implied_volatility(actual_price=price)
+                implied_vols[i, j] = iv
+
+        mask = ~np.isnan(implied_vols)
+        valid_rows = mask.any(axis=1)
+        valid_cols = mask.any(axis=0)
+
+        implied_vols = implied_vols[valid_rows][:, valid_cols]
+        time_to_mat = pivot_table.index[valid_rows]
+        strikes = pivot_table.columns[valid_cols]
+
+        if implied_vols.size == 0:
+            raise ValueError("No valid implied volatilities found.")
+
+        ttm_grid, strike_grid = np.meshgrid(time_to_mat, strikes, indexing='ij')
+        self._ttm_grid = ttm_grid
+        self._strike_grid = strike_grid
+
+        logging.info(f"Implied Volatility Surface: \n{implied_vols}")
+
+        return implied_vols, ttm_grid, strike_grid
+
+
+# ----------------------- View Components -----------------------
+
+class MatplotlibCanvas(FigureCanvas):
+    def __init__(self, parent=None, width=5, height=4, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.axes = self.fig.add_subplot(111, projection='3d')
+        super(MatplotlibCanvas, self).__init__(self.fig)
+
+        # Variables for interactivity
+        self.text = None
+        self.highlight = None
+        self.cid = None
+
+        # Grids and values for the volatility surface
+        self.strike_grid = None
+        self.ttm_grid = None
+        self.iv_values = None
+        self._spot = None  # For storing the spot price
+
+    def plot_surface(self, ttm_grid, strike_grid, iv_values, spot_price):
+        self.axes.clear()
+
+        # Store the grids and values for use in interactivity
+        self.ttm_grid = ttm_grid
+        self.strike_grid = strike_grid
+        self.iv_values = iv_values
+        self._spot = spot_price
+
+        # Calculate moneyness (log scale)
+        moneyness = np.log(strike_grid / spot_price)
+
+        # Plot surface with enhanced visuals
+        surf = self.axes.plot_surface(
+            ttm_grid, moneyness, iv_values, cmap="plasma", edgecolor="none", antialiased=True, alpha=0.8
+        )
+
+        # Color bar for implied volatility
+        cbar = self.fig.colorbar(surf, ax=self.axes, pad=0.1, shrink=0.7)
+        cbar.set_label("Implied Volatility", fontsize=12, labelpad=10)
+
+        # Set labels
+        self.axes.set_xlabel("Time to Maturity (Years)", fontsize=12, labelpad=10, fontweight='bold')
+        self.axes.set_ylabel("Moneyness (Log Scale)", fontsize=12, labelpad=10, fontweight='bold')
+        self.axes.set_zlabel("Implied Volatility", fontsize=12, labelpad=10, fontweight='bold')
+        self.axes.set_title("Implied Volatility Surface", fontsize=14, fontweight='bold', pad=20)
+
+        # Interactive annotations
+        self.text = self.axes.text2D(0.05, 0.95, "", transform=self.axes.transAxes, fontsize=10, color='white')
+        self.highlight, = self.axes.plot([], [], [], 'ro', markersize=5)  # For highlighting the point
+
+        # Connect mouse events for interactivity
+        self.cid = self.mpl_connect('motion_notify_event', self.on_hover)
+
+        self.draw()
+
+    def on_hover(self, event):
+        # Check if the mouse is over the axes
+        if event.inaxes == self.axes and self.strike_grid is not None and self.ttm_grid is not None:
+            # Transform 2D mouse coordinates into 3D space
+            x_mouse, y_mouse = event.xdata, event.ydata
+
+            # Get the closest point on the surface
+            moneyness_data = np.log(self.strike_grid / self._spot)
+            ttm_data = self.ttm_grid
+            iv_data = self.iv_values
+
+            # Find the closest point to the cursor
+            closest_idx = np.unravel_index(np.argmin(np.sqrt((moneyness_data - x_mouse) ** 2 + (ttm_data - y_mouse) ** 2)), moneyness_data.shape)
+            x_closest, y_closest, z_closest = moneyness_data[closest_idx], ttm_data[closest_idx], iv_data[closest_idx]
+
+            # Update the text annotation and highlight
+            self.text.set_text(f"IV: {z_closest:.2f}, Moneyness: {x_closest:.2f}, TTM: {y_closest:.2f}")
+            self.highlight.set_data([x_closest], [y_closest])
+            self.highlight.set_3d_properties([z_closest])
+
+            # Redraw the canvas to update the changes
+            self.draw_idle()
+
+
+# ----------------------- Worker Thread -----------------------
+
+class WorkerThread(QThread):
+    progress = pyqtSignal(float)
+    finished = pyqtSignal(object, object, object)
+    error = pyqtSignal(str)
+
+    def __init__(self, volatility_surface):
+        super().__init__()
+        self.vol_surface = volatility_surface
+
+    def run(self):
+        try:
+            iv_values, ttm_grid, strike_grid = self.vol_surface.generate_implied_volatility_surface()
+            self.finished.emit(iv_values, ttm_grid, strike_grid)
+        except Exception as e:
+            logging.error(f"WorkerThread encountered an error: {e}")
+            self.error.emit(str(e))
+
+
+# ----------------------- Main Window -----------------------
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Implied Volatility Surface Generator")
+        self.setGeometry(100, 100, 1200, 800)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        # Group Inputs
+        input_group = QGroupBox("Input Parameters")
+        input_layout = QFormLayout()
+
+        # File Input
+        self.file_input = QLineEdit()
+        self.file_input.setPlaceholderText("Select options data file")
+        file_button = QPushButton("Browse")
+        file_button.clicked.connect(self.on_browse)
+        file_button.setToolTip("Browse and select the CSV file containing options data")
+        input_layout.addRow(QLabel("File Path:"), self.file_input)
+        input_layout.addRow(QLabel(""), file_button)
+
+        # Risk-Free Rate
+        self.rate_input = QLineEdit()
+        self.rate_input.setPlaceholderText("e.g., 4.67")
+        self.rate_input.setToolTip("Enter the risk-free interest rate as a percentage (e.g., 4.67)")
+        input_layout.addRow(QLabel("Risk-Free Rate (%):"), self.rate_input)
+
+        # Option Type Combo Box
+        self.option_combo = QComboBox()
+        self.option_combo.addItems(["Call", "Put"])
+        self.option_combo.setToolTip("Select whether to calculate for Call or Put options")
+        input_layout.addRow(QLabel("Option Type:"), self.option_combo)
+
+        input_group.setLayout(input_layout)
+        layout.addWidget(input_group)
+
+        # Generate and Save Button Layout
+        button_layout = QHBoxLayout()
+        self.generate_button = QPushButton("Generate Volatility Surface")
+        self.generate_button.clicked.connect(self.on_generate)
+        button_layout.addWidget(self.generate_button)
+
+        self.save_button = QPushButton("Save Plot")
+        self.save_button.clicked.connect(self.on_save)
+        self.save_button.setEnabled(False)  # Only enabled after generating the plot
+        button_layout.addWidget(self.save_button)
+
+        layout.addLayout(button_layout)
+
+        # Progress Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.progress_bar)
+
+        # Matplotlib Canvas
+        self.canvas = MatplotlibCanvas(self, width=10, height=6, dpi=100)
+        layout.addWidget(self.canvas)
+
+        self.setLayout(layout)
+
+    def on_browse(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV File", "", "CSV Files (*.csv);;All Files (*)")
+        if file_path:
+            self.file_input.setText(file_path)
+
+    def on_generate(self):
+        file_path = self.file_input.text().strip()
+        rate_text = self.rate_input.text().strip()
+        option_type = self.option_combo.currentText().lower()
+
+        if not file_path:
+            self.show_error("Please select a file.")
+            return
+
+        try:
+            risk_free_rate = float(rate_text) / 100 if rate_text else 0.0467
+            if risk_free_rate < 0:
+                raise ValueError
+        except ValueError:
+            self.show_error("Invalid risk-free rate. Please enter a non-negative numerical value.")
+            return
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Starting...")
+        self.progress_bar.show()
+
+        try:
+            vol_surface = VolatilitySurfaceFromFile(
+                file_path=file_path, risk_free_rate=risk_free_rate,
+                option_type=option_type
+            )
+        except Exception as e:
+            self.show_error(str(e))
+            return
+
+        self.thread = WorkerThread(vol_surface)
+        self.thread.finished.connect(self.on_finished)
+        self.thread.error.connect(self.on_error)
+        self.thread.start()
+
+    def on_finished(self, iv_values, ttm_grid, strike_grid):
+        self.progress_bar.setFormat("Completed.")
+        self.save_button.setEnabled(True)  # Enable the save button after successful plot generation
+        try:
+            self.canvas.plot_surface(ttm_grid, strike_grid, iv_values, self.thread.vol_surface._spot)
+            logging.info("Volatility surface plotted successfully.")
+        except Exception as e:
+            self.show_error(f"Error plotting surface: {str(e)}")
+
+    def on_save(self):
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Plot", "", "PNG Image (*.png);;JPEG Image (*.jpg);;All Files (*)", options=options
+        )
+        if file_path:
+            try:
+                self.canvas.figure.savefig(file_path)
+                QMessageBox.information(self, "Success", f"Plot saved to {file_path}")
+                logging.info(f"Plot saved to {file_path}")
+            except Exception as e:
+                self.show_error(f"Failed to save plot: {str(e)}")
+
+    def on_error(self, message):
+        self.progress_bar.hide()
+        self.show_error(message)
+
+    def show_error(self, message):
+        QMessageBox.critical(self, "Error", message)
+
+# ----------------------- Main Application -----------------------
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
